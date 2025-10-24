@@ -1,0 +1,497 @@
+/*
+* PISO Algorithm Implementation in C++
+* Solves 2D Unsteady Lid-Driven Cavity Problem
+* Author: J YADAGIRI | CFD Engineer
+* https://www.linkedin.com/in/j-yadagiri-4944ba21b?utm_source=share&utm_campaign=share_via&utm_content=profile&utm_medium=android_app
+* Pressure-Implicit with Split Operator (PISO)
+* Reference: R. Issa (1986) - Journal of Computational Physics
+*
+* Algorithm: 1 Predictor + 2 Correctors (No Sub-Iterations)
+*/
+
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <algorithm>
+
+class PISOSolver {
+private:
+// Grid parameters
+int nx, ny;
+double dx, dy;
+double Lx, Ly;
+
+// Fluid properties
+double rho, mu, nu;
+
+// Time parameters
+double dt;
+double t_current;
+double t_final;
+
+// Under-relaxation factors (for stability)
+double alpha_u, alpha_v, alpha_p;
+
+// Number of pressure correctors
+int n_correctors;
+int n_ortho_correct;
+
+// Field variables - Staggered grid arrangement
+std::vector<std::vector<double>> u, v, p; // Primary fields
+std::vector<std::vector<double>> u_old, v_old; // Previous time step
+std::vector<std::vector<double>> u_star, v_star; // Momentum predictor
+std::vector<std::vector<double>> p_prime; // Pressure correction
+std::vector<std::vector<double>> u_prime, v_prime; // Velocity correction
+
+// Coefficient matrices for pressure equation
+std::vector<std::vector<double>> a_p, a_e, a_w, a_n, a_s;
+
+public:
+PISOSolver(int nx_, int ny_, double Lx_, double Ly_,
+double rho_, double mu_, double dt_, double t_final_)
+: nx(nx_), ny(ny_), Lx(Lx_), Ly(Ly_),
+rho(rho_), mu(mu_), dt(dt_), t_final(t_final_) {
+
+dx = Lx / (nx - 1);
+dy = Ly / (ny - 1);
+nu = mu / rho;
+t_current = 0.0;
+
+// PISO typically uses less under-relaxation than SIMPLE
+alpha_u = 0.9;
+alpha_v = 0.9;
+alpha_p = 0.5;
+
+// Number of corrector steps (standard PISO: 2)
+n_correctors = 2;
+n_ortho_correct = 2; // For non-orthogonal grids
+
+// Initialize all field variables
+initializeFields();
+
+std::cout << "PISO Solver Initialized
+";
+std::cout << "Grid: " << nx << " x " << ny << "
+";
+std::cout << "Reynolds Number: " << (1.0 * Lx / nu) << "
+";
+std::cout << "Time step: " << dt << " s
+";
+std::cout << "Final time: " << t_final << " s
+";
+std::cout << "CFL number: " << computeCFL() << "
+
+";
+}
+
+void initializeFields() {
+u.resize(nx, std::vector<double>(ny, 0.0));
+v.resize(nx, std::vector<double>(ny, 0.0));
+p.resize(nx, std::vector<double>(ny, 0.0));
+
+u_old.resize(nx, std::vector<double>(ny, 0.0));
+v_old.resize(nx, std::vector<double>(ny, 0.0));
+
+u_star.resize(nx, std::vector<double>(ny, 0.0));
+v_star.resize(nx, std::vector<double>(ny, 0.0));
+
+p_prime.resize(nx, std::vector<double>(ny, 0.0));
+u_prime.resize(nx, std::vector<double>(ny, 0.0));
+v_prime.resize(nx, std::vector<double>(ny, 0.0));
+
+a_p.resize(nx, std::vector<double>(ny, 0.0));
+a_e.resize(nx, std::vector<double>(ny, 0.0));
+a_w.resize(nx, std::vector<double>(ny, 0.0));
+a_n.resize(nx, std::vector<double>(ny, 0.0));
+a_s.resize(nx, std::vector<double>(ny, 0.0));
+}
+
+double computeCFL() {
+double u_max = 0.0, v_max = 0.0;
+for (int i = 0; i < nx; i++) {
+for (int j = 0; j < ny; j++) {
+u_max = std::max(u_max, std::abs(u[i][j]));
+v_max = std::max(v_max, std::abs(v[i][j]));
+}
+}
+return (u_max * dt / dx + v_max * dt / dy);
+}
+
+// ============================================================
+// STEP 1: MOMENTUM PREDICTOR (Solve with old pressure field)
+// ============================================================
+void momentumPredictor() {
+// Store previous time step values
+u_old = u;
+v_old = v;
+
+// X-Momentum Predictor
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+// Time derivative (implicit Euler)
+double du_dt = (u[i][j] - u_old[i][j]) / dt;
+
+// Convective terms (upwind or central differencing)
+double u_e = 0.5 * (u[i][j] + u[i+1][j]);
+double u_w = 0.5 * (u[i][j] + u[i-1][j]);
+double u_n = 0.5 * (u[i][j] + u[i][j+1]);
+double u_s = 0.5 * (u[i][j] + u[i][j-1]);
+
+double conv_x = (u_e * u_e - u_w * u_w) / dx;
+double conv_y = (u_n * v[i][j] - u_s * v[i][j]) / dy;
+
+// Diffusive terms (central differencing)
+double diff_x = nu * (u[i+1][j] - 2*u[i][j] + u[i-1][j]) / (dx*dx);
+double diff_y = nu * (u[i][j+1] - 2*u[i][j] + u[i][j-1]) / (dy*dy);
+
+// Pressure gradient (using OLD pressure field)
+double dp_dx = (p[i+1][j] - p[i-1][j]) / (2.0 * dx);
+
+// Momentum predictor (u*)
+u_star[i][j] = u_old[i][j] + dt * (
+-conv_x - conv_y + diff_x + diff_y - dp_dx / rho
+);
+}
+}
+
+// Y-Momentum Predictor
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+double dv_dt = (v[i][j] - v_old[i][j]) / dt;
+
+double v_e = 0.5 * (v[i][j] + v[i+1][j]);
+double v_w = 0.5 * (v[i][j] + v[i-1][j]);
+double v_n = 0.5 * (v[i][j] + v[i][j+1]);
+double v_s = 0.5 * (v[i][j] + v[i][j-1]);
+
+double conv_x = (u[i][j] * v_e - u[i][j] * v_w) / dx;
+double conv_y = (v_n * v_n - v_s * v_s) / dy;
+
+double diff_x = nu * (v[i+1][j] - 2*v[i][j] + v[i-1][j]) / (dx*dx);
+double diff_y = nu * (v[i][j+1] - 2*v[i][j] + v[i][j-1]) / (dy*dy);
+
+double dp_dy = (p[i][j+1] - p[i][j-1]) / (2.0 * dy);
+
+v_star[i][j] = v_old[i][j] + dt * (
+-conv_x - conv_y + diff_x + diff_y - dp_dy / rho
+);
+}
+}
+}
+
+// ============================================================
+// STEP 2: PRESSURE CORRECTION EQUATION (Poisson Equation)
+// ============================================================
+void assemblePressureCoefficientMatrix() {
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+// Compute coefficients for pressure equation
+// These come from discretized continuity equation
+double dt_over_rho = dt / rho;
+
+a_e[i][j] = dt_over_rho / (dx * dx);
+a_w[i][j] = dt_over_rho / (dx * dx);
+a_n[i][j] = dt_over_rho / (dy * dy);
+a_s[i][j] = dt_over_rho / (dy * dy);
+
+a_p[i][j] = a_e[i][j] + a_w[i][j] + a_n[i][j] + a_s[i][j];
+}
+}
+}
+
+void solvePressureCorrection() {
+// Reset pressure correction
+for (int i = 0; i < nx; i++) {
+for (int j = 0; j < ny; j++) {
+p_prime[i][j] = 0.0;
+}
+}
+
+// Gauss-Seidel iteration for pressure Poisson equation
+int max_iter = 100;
+double tolerance = 1e-8;
+
+for (int iter = 0; iter < max_iter; iter++) {
+double max_residual = 0.0;
+
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+// Mass source (continuity residual)
+double mass_source = (
+(u_star[i+1][j] - u_star[i-1][j]) / (2.0 * dx) +
+(v_star[i][j+1] - v_star[i][j-1]) / (2.0 * dy)
+);
+
+// Pressure correction Poisson equation
+double p_prime_new = (1.0 / a_p[i][j]) * (
+a_e[i][j] * p_prime[i+1][j] +
+a_w[i][j] * p_prime[i-1][j] +
+a_n[i][j] * p_prime[i][j+1] +
+a_s[i][j] * p_prime[i][j-1] -
+rho * mass_source / dt
+);
+
+double residual = std::abs(p_prime_new - p_prime[i][j]);
+max_residual = std::max(max_residual, residual);
+
+p_prime[i][j] = p_prime_new;
+}
+}
+
+// Apply boundary conditions for pressure correction
+applyPressureCorrectionBC();
+
+if (max_residual < tolerance) break;
+}
+}
+
+void applyPressureCorrectionBC() {
+// Neumann BC (zero gradient) for pressure correction
+for (int i = 0; i < nx; i++) {
+p_prime[i][0] = p_prime[i][1];
+p_prime[i][ny-1] = p_prime[i][ny-2];
+}
+for (int j = 0; j < ny; j++) {
+p_prime[0][j] = p_prime[1][j];
+p_prime[nx-1][j] = p_prime[nx-2][j];
+}
+}
+
+// ============================================================
+// STEP 3: VELOCITY AND PRESSURE CORRECTION
+// ============================================================
+void correctVelocityAndPressure() {
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+// Compute velocity correction
+double dp_prime_dx = (p_prime[i+1][j] - p_prime[i-1][j]) / (2.0 * dx);
+double dp_prime_dy = (p_prime[i][j+1] - p_prime[i][j-1]) / (2.0 * dy);
+
+u_prime[i][j] = -(dt / rho) * dp_prime_dx;
+v_prime[i][j] = -(dt / rho) * dp_prime_dy;
+
+// Update velocity field
+u[i][j] = u_star[i][j] + u_prime[i][j];
+v[i][j] = v_star[i][j] + v_prime[i][j];
+
+// Update pressure field
+p[i][j] += alpha_p * p_prime[i][j];
+}
+}
+}
+
+// ============================================================
+// APPLY BOUNDARY CONDITIONS
+// ============================================================
+void applyBoundaryConditions() {
+// Top wall - Moving lid (Dirichlet BC)
+for (int i = 0; i < nx; i++) {
+u[i][ny-1] = 1.0; // Lid velocity
+v[i][ny-1] = 0.0;
+}
+
+// Bottom wall - No-slip
+for (int i = 0; i < nx; i++) {
+u[i][0] = 0.0;
+v[i][0] = 0.0;
+}
+
+// Left and Right walls - No-slip
+for (int j = 0; j < ny; j++) {
+u[0][j] = 0.0;
+v[0][j] = 0.0;
+u[nx-1][j] = 0.0;
+v[nx-1][j] = 0.0;
+}
+
+// Pressure boundary conditions (Neumann - zero gradient)
+for (int i = 0; i < nx; i++) {
+p[i][0] = p[i][1];
+p[i][ny-1] = p[i][ny-2];
+}
+for (int j = 0; j < ny; j++) {
+p[0][j] = p[1][j];
+p[nx-1][j] = p[nx-2][j];
+}
+
+// Fix reference pressure at one point
+p[0][0] = 0.0;
+}
+
+// ============================================================
+// MAIN PISO TIME LOOP
+// ============================================================
+void solve() {
+int time_step = 0;
+int output_interval = 50;
+
+std::cout << "Starting PISO Algorithm Time Integration...
+
+";
+
+assemblePressureCoefficientMatrix();
+
+while (t_current < t_final) {
+time_step++;
+t_current += dt;
+
+// STEP 1: Momentum Predictor
+momentumPredictor();
+applyBoundaryConditions();
+
+// STEPS 2-3: Corrector loops (typically 2 for PISO)
+for (int corrector = 0; corrector < n_correctors; corrector++) {
+// Solve pressure correction equation
+solvePressureCorrection();
+
+// Correct velocities and pressure
+correctVelocityAndPressure();
+
+// Apply boundary conditions
+applyBoundaryConditions();
+
+// Update u_star and v_star for next corrector
+u_star = u;
+v_star = v;
+}
+
+// Monitor solution
+if (time_step % output_interval == 0) {
+double max_div = computeMaxDivergence();
+double cfl = computeCFL();
+
+std::cout << "Time Step: " << std::setw(5) << time_step
+<< " | Time: " << std::fixed << std::setprecision(4) << t_current
+<< " | CFL: " << std::setprecision(3) << cfl
+<< " | Max Div: " << std::scientific << max_div
+<< std::endl;
+}
+}
+
+std::cout << "
+✓ PISO simulation completed successfully!
+";
+std::cout << "Total time steps: " << time_step << "
+";
+}
+
+double computeMaxDivergence() {
+double max_div = 0.0;
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+double div = std::abs(
+(u[i+1][j] - u[i-1][j]) / (2.0 * dx) +
+(v[i][j+1] - v[i][j-1]) / (2.0 * dy)
+);
+max_div = std::max(max_div, div);
+}
+}
+return max_div;
+}
+
+// ============================================================
+// OUTPUT RESULTS
+// ============================================================
+void exportResults(const std::string& filename) {
+std::ofstream file(filename);
+file << "x,y,u,v,p,u_magnitude
+";
+
+for (int i = 0; i < nx; i++) {
+for (int j = 0; j < ny; j++) {
+double x = i * dx;
+double y = j * dy;
+double u_mag = std::sqrt(u[i][j]*u[i][j] + v[i][j]*v[i][j]);
+
+file << x << "," << y << ","
+<< u[i][j] << "," << v[i][j] << ","
+<< p[i][j] << "," << u_mag << "
+";
+}
+}
+
+file.close();
+std::cout << "
+✓ Results exported to " << filename << "
+";
+}
+
+void exportCenterlineVelocity(const std::string& filename) {
+std::ofstream file(filename);
+file << "y,u_centerline
+";
+
+int i_center = nx / 2;
+for (int j = 0; j < ny; j++) {
+file << j * dy << "," << u[i_center][j] << "
+";
+}
+
+file.close();
+std::cout << "✓ Centerline velocity exported to " << filename << "
+";
+}
+};
+
+// ============================================================
+// MAIN FUNCTION
+// ============================================================
+int main() {
+std::cout << "=================================================
+";
+std::cout << " PISO Algorithm - 2D Lid-Driven Cavity Flow
+";
+std::cout << " Pressure-Implicit with Split Operator
+";
+std::cout << "=================================================
+
+";
+
+// Problem parameters
+int nx = 65; // Grid points in x
+int ny = 65; // Grid points in y
+double Lx = 1.0; // Domain length
+double Ly = 1.0; // Domain height
+double rho = 1.0; // Density [kg/m^3]
+double mu = 0.01; // Dynamic viscosity [Pa·s]
+double Re = 100.0; // Reynolds number
+double U_lid = 1.0; // Lid velocity
+
+// Time parameters
+double dt = 0.001; // Time step [s]
+double t_final = 5.0; // Final simulation time [s]
+
+std::cout << "Problem Setup:
+";
+std::cout << " Reynolds Number: " << Re << "
+";
+std::cout << " Grid Resolution: " << nx << " x " << ny << "
+";
+std::cout << " Time Step: " << dt << " s
+";
+std::cout << " Total Simulation Time: " << t_final << " s
+
+";
+
+// Create PISO solver
+PISOSolver solver(nx, ny, Lx, Ly, rho, mu, dt, t_final);
+
+// Run simulation
+solver.solve();
+
+// Export results
+solver.exportResults("piso_results.csv");
+solver.exportCenterlineVelocity("piso_centerline.csv");
+
+std::cout << "
+=================================================
+";
+std::cout << " Simulation Complete - Ready for Analysis
+";
+std::cout << "=================================================
+";
+
+return 0;
+}
